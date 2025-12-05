@@ -394,6 +394,9 @@ export const useWebSocketStore = defineStore('websocket', () => {
       
       // 只在状态首次变化时添加日志（从 running 变为其他状态）
       if (prevRunning && !message.training.running) {
+        // 重置训练开始时间
+        trainingStartTime = null
+        
         if (message.training.status === 'completed') {
           addLog('训练完成！', 'success')
         } else if (message.training.status === 'failed') {
@@ -477,6 +480,9 @@ export const useWebSocketStore = defineStore('websocket', () => {
     }
   }
 
+  // 训练开始时间（用于自动计算时间）
+  let trainingStartTime: number | null = null
+  
   /**
    * 处理训练进度
    */
@@ -492,6 +498,28 @@ export const useWebSocketStore = defineStore('websocket', () => {
     if (progress.step) {
       update.currentStep = progress.step.current
       update.totalSteps = progress.step.total || trainingStore.progress.totalSteps
+      
+      // 自动计算时间（当没有 tqdm 时间信息时）
+      if (!progress.time && progress.step.current > 0) {
+        // 记录训练开始时间（第一次收到 step > 0 时）
+        if (!trainingStartTime) {
+          trainingStartTime = Date.now()
+        }
+        
+        const elapsedMs = Date.now() - trainingStartTime
+        const elapsedSec = Math.floor(elapsedMs / 1000)
+        update.elapsedTime = elapsedSec
+        
+        // 基于当前进度估算剩余时间
+        const currentStep = progress.step.current
+        const totalSteps = progress.step.total || trainingStore.progress.totalSteps
+        if (currentStep > 0 && totalSteps > 0) {
+          const progressPercent = currentStep / totalSteps
+          const estimatedTotalSec = elapsedSec / progressPercent
+          const remainingSec = Math.max(0, Math.floor(estimatedTotalSec - elapsedSec))
+          update.estimatedTimeRemaining = remainingSec
+        }
+      }
     }
     
     if (progress.loss !== undefined) {
