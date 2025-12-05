@@ -671,6 +671,25 @@
           <el-icon><InfoFilled /></el-icon>
           <span>适应性合并通过微调图片尺寸（最多 ±{{ bucketConfig.tolerance }}px）将零散的小桶合并到大桶中，有效减少训练时的图片丢弃。</span>
         </div>
+        
+        <!-- 裁剪进度 -->
+        <div class="crop-progress" v-if="adaptiveCropState.running || adaptiveCropState.completed > 0">
+          <div class="progress-header">
+            <span>裁剪进度</span>
+            <span class="progress-text">{{ adaptiveCropState.completed }}/{{ adaptiveCropState.total }}</span>
+          </div>
+          <el-progress 
+            :percentage="adaptiveCropState.total > 0 ? Math.round(adaptiveCropState.completed / adaptiveCropState.total * 100) : 0"
+            :status="adaptiveCropState.running ? undefined : 'success'"
+          />
+          <div class="progress-detail" v-if="adaptiveCropState.current_file">
+            正在处理: {{ adaptiveCropState.current_file }}
+          </div>
+          <div class="progress-stats" v-if="!adaptiveCropState.running && adaptiveCropState.completed > 0">
+            <el-tag type="success" size="small">已裁剪 {{ adaptiveCropState.cropped }}</el-tag>
+            <el-tag type="info" size="small" v-if="adaptiveCropState.skipped > 0">跳过 {{ adaptiveCropState.skipped }}</el-tag>
+          </div>
+        </div>
       </div>
       
       <div class="bucket-empty" v-else-if="!calculatingBuckets">
@@ -679,7 +698,26 @@
       </div>
       
       <template #footer>
-        <el-button @click="showBucketCalculator = false">关闭</el-button>
+        <div class="dialog-footer">
+          <el-button @click="showBucketCalculator = false">关闭</el-button>
+          <el-button 
+            v-if="bucketConfig.enableAdaptive && bucketSummary.savedImages > 0"
+            type="primary"
+            :loading="adaptiveCropState.running"
+            :disabled="adaptiveCropState.running"
+            @click="applyAdaptiveCrop"
+          >
+            <el-icon v-if="!adaptiveCropState.running"><Scissor /></el-icon>
+            {{ adaptiveCropState.running ? '裁剪中...' : '应用适应性裁剪' }}
+          </el-button>
+          <el-button 
+            v-if="adaptiveCropState.running"
+            type="danger"
+            @click="stopAdaptiveCrop"
+          >
+            停止
+          </el-button>
+        </div>
       </template>
     </el-dialog>
   </div>
@@ -691,7 +729,7 @@ import { useDatasetStore, type DatasetImage } from '@/stores/dataset'
 import { useTrainingStore } from '@/stores/training'
 import { useWebSocketStore } from '@/stores/websocket'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, InfoFilled, WarningFilled, MagicStick, ScaleToOriginal, Loading, Clock, Grid } from '@element-plus/icons-vue'
+import { Delete, InfoFilled, WarningFilled, MagicStick, ScaleToOriginal, Loading, Clock, Grid, Scissor } from '@element-plus/icons-vue'
 import axios from 'axios'
 
 const datasetStore = useDatasetStore()
@@ -787,6 +825,93 @@ const bucketSummary = computed(() => {
   const savedImages = Math.max(0, originalDropped.value - droppedImages)
   return { totalImages, totalBatches, droppedImages, mergedBuckets, savedImages }
 })
+
+// 适应性裁剪状态
+const adaptiveCropState = ref({
+  running: false,
+  total: 0,
+  completed: 0,
+  current_file: '',
+  cropped: 0,
+  skipped: 0
+})
+
+let cropPollTimer: number | null = null
+
+async function applyAdaptiveCrop() {
+  if (!currentView.value) return
+  
+  try {
+    await ElMessageBox.confirm(
+      '适应性裁剪将修改原始图片文件（居中裁剪），此操作不可撤销。\n\n裁剪完成后需要重新生成 Latent 缓存才能在训练中生效。\n\n确定要继续吗？',
+      '确认裁剪',
+      { confirmButtonText: '开始裁剪', cancelButtonText: '取消', type: 'warning' }
+    )
+  } catch {
+    return
+  }
+  
+  try {
+    const res = await axios.post('/api/dataset/adaptive-crop', {
+      dataset_path: currentView.value,
+      resolution_limit: bucketConfig.value.resolutionLimit,
+      batch_size: bucketConfig.value.batchSize,
+      tolerance: bucketConfig.value.tolerance
+    })
+    
+    if (res.data.total === 0) {
+      ElMessage.info(res.data.message)
+      return
+    }
+    
+    ElMessage.success(`开始裁剪 ${res.data.total} 张图片`)
+    adaptiveCropState.value.running = true
+    startCropPolling()
+    
+  } catch (error: any) {
+    ElMessage.error('启动裁剪失败: ' + (error.response?.data?.detail || error.message))
+  }
+}
+
+function startCropPolling() {
+  if (cropPollTimer) clearInterval(cropPollTimer)
+  
+  cropPollTimer = window.setInterval(async () => {
+    try {
+      const res = await axios.get('/api/dataset/adaptive-crop/status')
+      adaptiveCropState.value = res.data
+      
+      if (!res.data.running) {
+        stopCropPolling()
+        if (res.data.cropped > 0) {
+          ElMessage.success(`裁剪完成！已处理 ${res.data.cropped} 张图片。请重新生成 Latent 缓存。`)
+          // 刷新数据集
+          await datasetStore.scanDataset(currentView.value!)
+        }
+      }
+    } catch {
+      stopCropPolling()
+    }
+  }, 500)
+}
+
+function stopCropPolling() {
+  if (cropPollTimer) {
+    clearInterval(cropPollTimer)
+    cropPollTimer = null
+  }
+}
+
+async function stopAdaptiveCrop() {
+  try {
+    await axios.post('/api/dataset/adaptive-crop/stop')
+    adaptiveCropState.value.running = false
+    stopCropPolling()
+    ElMessage.info('已停止裁剪')
+  } catch (error: any) {
+    ElMessage.error('停止失败')
+  }
+}
 
 function getBucketColor(aspectRatio: number): string {
   if (aspectRatio < 0.8) return '#67c23a' // 竖图 - 绿色
@@ -2605,6 +2730,48 @@ function formatSize(bytes: number): string {
       flex-shrink: 0;
       margin-top: 2px;
     }
+  }
+  
+  .crop-progress {
+    margin-top: 16px;
+    padding: 16px;
+    background: var(--bg-card);
+    border-radius: var(--radius-md);
+    border: 1px solid var(--border-color);
+    
+    .progress-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+      font-size: 13px;
+      
+      .progress-text {
+        color: var(--text-muted);
+        font-family: var(--font-mono);
+      }
+    }
+    
+    .progress-detail {
+      margin-top: 8px;
+      font-size: 12px;
+      color: var(--text-muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    
+    .progress-stats {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+    }
+  }
+  
+  .dialog-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
   }
   
   .bucket-empty {
